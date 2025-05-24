@@ -1,0 +1,83 @@
+[
+    {
+      "name": "Express Avenue Mall",
+      "latitude": 13.0627,
+      "longitude": 80.2707
+    },
+    {
+      "name": "Phoenix MarketCity",
+      "latitude": 12.9894,
+      "longitude": 80.2171
+    },
+    {
+      "name": "Spencer Plaza",
+      "latitude": 13.0632,
+      "longitude": 80.2643
+    },
+    {
+      "name": "T Nagar - Panagal Park",
+      "latitude": 13.0421,
+      "longitude": 80.2335
+    },
+    {
+      "name": "Besant Nagar Beach",
+      "latitude": 13.0006,
+      "longitude": 80.2663
+    },
+    {
+      "name": "Marina Beach",
+      "latitude": 13.0500,
+      "longitude": 80.2824
+    },
+    {
+      "name": "Chennai Central Railway Station",
+      "latitude": 13.0827,
+      "longitude": 80.2757
+    },
+    {
+      "name": "Egmore Railway Station",
+      "latitude": 13.0740,
+      "longitude": 80.2606
+    },
+    {
+      "name": "Guindy Industrial Estate",
+      "latitude": 13.0072,
+      "longitude": 80.2186
+    },
+    {
+      "name": "OMR - Tidel Park",
+      "latitude": 12.9840,
+      "longitude": 80.2486
+    },
+    {
+      "name": "Mylapore Kapaleeshwarar Temple",
+      "latitude": 13.0330,
+      "longitude": 80.2681
+    },
+    {
+      "name": "Valluvar Kottam",
+      "latitude": 13.0524,
+      "longitude": 80.2355
+    },
+    {
+      "name": "Velachery MRTS Station",
+      "latitude": 12.9792,
+      "longitude": 80.2184
+    },
+    {
+      "name": "Perambur Railway Station",
+      "latitude": 13.1087,
+      "longitude": 80.2337
+    },
+    {
+      "name": "Tambaram Railway Station",
+      "latitude": 9.4725,
+      "longitude": 80.1162
+    },
+    {
+      "name": "Near Court Road",
+      "latitude": 12.9246,
+      "longitude":  77.8
+    }
+  ]
+  

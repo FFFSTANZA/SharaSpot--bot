@@ -1,0 +1,38 @@
+[
+    {
+      "id": "owner1",
+      "name": "Owner A",
+      "lat": 9.4732,
+      "lon": 77.8020,
+      "status": "active",
+      "availableVehicleTypes": ["4-seat car", "6-seat car"]
+    },
+    {
+      "id": "owner2",
+      "name": "Owner B",
+      "lat": 12.9550,
+      "lon": 77.6300,
+      "status": "active",
+      "availableVehicleTypes": ["Two-wheeler", "Van"]
+    },
+    {
+      "id": "owner3",
+      "name": "Owner C",
+      "lat": 12.9780,
+      "lon": 77.6032,
+      "status": "inactive",
+      "availableVehicleTypes": ["4-seat car"]
+    },
+    {
+        "id": "owner4",   
+        "name": "Palani Kumar",
+        "lat": 12.9246,
+        "lon": 77.8,
+        "status": "active",
+        "phone": "+919943241684",
+        "location": "Near Court Road",
+        "availableVehicleTypes": ["4-seat car", "6-seat car"]
+      }
+      
+  ]
+  
