@@ -40,8 +40,22 @@ function setUserBooking(userId, booking) {
 }
 
 function getOwnerData(userId) {
-    return ownersData.find(owner => owner.phone === userId) || null;
+    const normalizePhone = (phone) => {
+        if (!phone || typeof phone !== 'string') return '';
+        return phone.replace(/[\s\-\(\)]/g, '').replace(/^\+/, '');
+    };
+
+    const normalizedUserId = normalizePhone(userId);
+
+    return ownersData.find(owner => {
+        if (!owner || !owner.phone) return false; 
+        const normalizedOwnerPhone = normalizePhone(owner.phone);
+        return normalizedOwnerPhone === normalizedUserId ||
+               normalizedOwnerPhone.endsWith(normalizedUserId) ||
+               normalizedUserId.endsWith(normalizedOwnerPhone);
+    }) || null;
 }
+
 
 function getAllOwners() {
     return [...ownersData];

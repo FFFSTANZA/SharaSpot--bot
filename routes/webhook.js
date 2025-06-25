@@ -51,20 +51,21 @@ router.post('/', async (req, res) => {
         const lowerCaseMessage = incomingMessage.toLowerCase();
         
         // First check if the user is an owner
-        const ownerCheck = checkAndSwitchToOwnerMode(userId);
-        if (ownerCheck.isOwner && !['hi', 'talk'].includes(lowerCaseMessage)) {
-            // If user is an owner and not trying to switch to AI mode
-            await sendWhatsAppMessage(userId, ownerCheck.message);
-            
-            // Now handle the message if it's not the initial greeting
-            if (incomingMessage) {
-                const ownerReply = await handleOwnerCommands(userId, incomingMessage);
-                if (ownerReply) {
-                    await sendWhatsAppMessage(userId, ownerReply);
-                }
-            }
-            return res.sendStatus(200);
+  const ownerCheck = checkAndSwitchToOwnerMode(userId);
+if (ownerCheck.isOwner && !['hi', 'talk', 'admin'].includes(lowerCaseMessage)) {
+    // If user is an owner and not trying to switch to AI mode or admin mode
+    if (!lowerCaseMessage) {
+        // Initial greeting for owner
+        await sendWhatsAppMessage(userId, ownerCheck.message);
+    } else {
+        // Handle owner commands
+        const ownerReply = await handleOwnerCommands(userId, incomingMessage);
+        if (ownerReply) {
+            await sendWhatsAppMessage(userId, ownerReply);
         }
+    }
+    return res.sendStatus(200);
+}
 
         // Admin commands check
         if (lowerCaseMessage.startsWith('admin') || lowerCaseMessage.includes('add owner') || 

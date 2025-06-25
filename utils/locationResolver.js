@@ -2,81 +2,119 @@ const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
 
+// Simple fuzzy matching function
+function fuzzyMatch(input, target, threshold = 0.6) {
+    const inputLower = input.toLowerCase();
+    const targetLower = target.toLowerCase();
+    
+    // Exact match
+    if (inputLower === targetLower) return 1;
+    
+    // Contains match
+    if (targetLower.includes(inputLower) || inputLower.includes(targetLower)) {
+        return 0.8;
+    }
+    
+    // Levenshtein distance based similarity
+    const distance = levenshteinDistance(inputLower, targetLower);
+    const maxLength = Math.max(inputLower.length, targetLower.length);
+    const similarity = 1 - (distance / maxLength);
+    
+    return similarity >= threshold ? similarity : 0;
+}
+
+function levenshteinDistance(str1, str2) {
+    const matrix = [];
+    
+    for (let i = 0; i <= str2.length; i++) {
+        matrix[i] = [i];
+    }
+    
+    for (let j = 0; j <= str1.length; j++) {
+        matrix[0][j] = j;
+    }
+    
+    for (let i = 1; i <= str2.length; i++) {
+        for (let j = 1; j <= str1.length; j++) {
+            if (str2.charAt(i - 1) === str1.charAt(j - 1)) {
+                matrix[i][j] = matrix[i - 1][j - 1];
+            } else {
+                matrix[i][j] = Math.min(
+                    matrix[i - 1][j - 1] + 1,
+                    matrix[i][j - 1] + 1,
+                    matrix[i - 1][j] + 1
+                );
+            }
+        }
+    }
+    
+    return matrix[str2.length][str1.length];
+}
+
 function loadPredefinedLocations() {
     try {
         const filePath = path.join(__dirname, '../data/predefinedLocations.json');
         if (fs.existsSync(filePath)) {
             const data = fs.readFileSync(filePath, 'utf-8');
-            const locations = JSON.parse(data);
-            
-            // Convert to the format used in the application
-            const formattedLocations = {};
-            locations.forEach(loc => {
-                formattedLocations[loc.name.toLowerCase()] = {
-                    lat: loc.latitude,
-                    lon: loc.longitude
-                };
-            });
-            return formattedLocations;
+            return JSON.parse(data);
         }
     } catch (error) {
         console.error("Error loading predefined locations:", error);
     }
-    
-    // Return default locations if file doesn't exist or has errors
-    return {
-        "bus stand": { lat: 9.4758, lon: 77.8033 },
-        "sivakasi railway station": { lat: 9.4707, lon: 77.8079 },
-        "sivakasi main road": { lat: 9.4743, lon: 77.8012 }
-    };
+    return [];
 }
 
-const predefinedLocations = loadPredefinedLocations();
-
-async function resolveTextLocation(query) {
-    const normalizedQuery = query.toLowerCase().trim().replace(/\s+/g, ' ');
-    console.log(`Received query: "${query}"`);
-
-    if (predefinedLocations[normalizedQuery]) {
-        const locationData = predefinedLocations[normalizedQuery];
-        console.log(`✅ Predefined location resolved for query "${query}":`, locationData);
-        return locationData;
-    }
-    
-    // Try to find partial matches in predefined locations
-    for (const [key, location] of Object.entries(predefinedLocations)) {
-        if (normalizedQuery.includes(key) || key.includes(normalizedQuery)) {
-            console.log(`✅ Partial match found for "${query}" with "${key}":`, location);
-            return location;
-        }
-    }
-    
-    const apiKey = '5b3ce3597851110001cf62489574382a0ad9442cacc6d12d5564db39';
-    const bbox = [77.75, 9.40, 77.85, 9.50]; // [min_lon, min_lat, max_lon, max_lat]
-    const url = `https://api.openrouteservice.org/geocode/search?api_key=${apiKey}&text=${encodeURIComponent(query)}&boundary.rect=${bbox.join(',')}&size=1`;
-
+async function resolveTextLocation(locationText) {
     try {
-        const res = await axios.get(url);
-
-        if (res.data && res.data.features && res.data.features.length > 0) {
-            const place = res.data.features[0];
-            const locationData = {
-                name: place.properties.label,
-                lat: place.geometry.coordinates[1],
-                lon: place.geometry.coordinates[0]
+        // First, try fuzzy matching with predefined locations
+        const predefinedLocations = loadPredefinedLocations();
+        let bestMatch = null;
+        let bestScore = 0;
+        
+        for (const location of predefinedLocations) {
+            const score = fuzzyMatch(locationText, location.name);
+            if (score > bestScore && score > 0.6) {
+                bestScore = score;
+                bestMatch = location;
+            }
+        }
+        
+        if (bestMatch) {
+            console.log(`Found predefined location: ${bestMatch.name} (score: ${bestScore})`);
+            return {
+                lat: bestMatch.latitude,
+                lon: bestMatch.longitude,
+                name: bestMatch.name
             };
-            console.log(`✅ Location resolved for query "${query}":`, locationData);
-            return locationData;
-        } else {
-            console.log(`⚠️ No location found for query: "${query}"`);
+        }
+        
+        // If no predefined location matches, try OpenRouteService
+        const apiKey = process.env.OPENROUTE_API_KEY;
+        if (!apiKey) {
+            console.error('OpenRouteService API key not found');
             return null;
         }
-    } catch (err) {
-        console.error(`❌ Error resolving location for query "${query}":`, err.message || err);
+        
+        const url = `https://api.openrouteservice.org/geocode/search?api_key=${apiKey}&text=${encodeURIComponent(locationText)}&boundary.country=IN&size=1`;
+        
+        const response = await axios.get(url);
+        
+        if (response.data.features && response.data.features.length > 0) {
+            const location = response.data.features[0];
+            const coordinates = location.geometry.coordinates;
+            
+            return {
+                lat: coordinates[1],
+                lon: coordinates[0],
+                name: location.properties.label
+            };
+        }
+        
+        return null;
+    } catch (error) {
+        console.error('Location resolution error:', error);
         return null;
     }
 }
 
-module.exports = {
-    resolveTextLocation
-};
+module.exports = { resolveTextLocation };
