@@ -15,6 +15,9 @@ const {
 
 function buildResponseMessage(mode, message) {
     // Unified mode indicator with emojis
+    if (mode === "AD"){
+        return message
+    }
     const prefix = mode === 'PARKING' ? '🅿️ Parking Mode' :
         (mode === 'OWNER' ? '🅿️ Owner Mode' : '💬 Shara AI');
     return `${prefix}: ${message}`;
@@ -199,9 +202,12 @@ router.post('/', async (req, res) => {
                 'AI',
                 `Welcome to SharaSpot!\nWherever you drive, Park Nearby\nOur service is currently available in Sivakasi and Rajapalayam, and we're expanding soon!\n\nType "Book" to reserve your parking space, or ask Shara AI anything for more info.\n\nPowered by Folonite.`
             );
+            const randomNum = Math.floor(Math.random() * 3) + 1;
+            const ad_title = Ads_arr[randomNum].title
+            const ad_desc = Ads_arr[randomNum].desc
             const reply2 = buildResponseMessage(
-                'AI',
-                `🎟️ Roaman's Coupon: **50% Off Your Order**\nCopy and paste this code at roamans.com: **CASMS**\nEnjoy 50% off on dresses, suites, shoes and more at Roaman's.`
+                'AD',
+                `🎟️ ${ad_title}: ${ad_desc}`
             );
 
             await sendWhatsAppMessage(userId, reply1);

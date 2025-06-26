@@ -62,28 +62,31 @@ async function getAIResponse(userMessage, uniqueId) {
 
     let prevMsg = []
     let aiMsg = []
+    const usersData = fs.readFileSync(path, 'utf-8');
+    const users = JSON.parse(usersData);
+    const user = users.find(u => u.uniqueId === uniqueId);
 
     try {
-        const usersData = fs.readFileSync(path, 'utf-8');
-        const users = JSON.parse(usersData);
-        const user = users.find(u => u.uniqueId === uniqueId);
-        if (user) {
-            prevMsg = user.prevMsg;
-        } else {
-            console.log('User not found');
+
+        if (user){
+
+            // check if there is user.prevMsg and store the user.prevMsg into the prevMsg array
+            if (user.prevMsg){
+                prevMsg = user.prevMsg;
+            } else {
+                console.log("Prev msg was not found 💔")
+            }
+            // check if there is user.prevMsg and store the user.prevMsg into the prevMsg array
+            if (user.aiMsg){
+                aiMsg = user.aiMsg;
+            } else {
+                console.log("Prev msg of ai was not found 💔")
+            }
 
         }
-
-        if (user.prevMsg) {
-            prevMsg = user.prevMsg;
-            console.log(prevMsg)
-        } else {
-            console.log("Prev msg of ai doesnot found 💔")
-        }
-
 
     } catch (error) {
-        console.log('User not found');
+        console.log('Soemthing went wrong!!');
     }
 
     // system prompt 
@@ -112,6 +115,19 @@ here are the previous messages sent by you give attention to them and give best 
 
 also dont respond or answer the previous messages in the current response take them as memory or context focus on the current query 
 strictly dont bring or talk about previous chats until and unless user asks or it is needed
+
+example conversation :
+
+user: u can call me amit only and i live in assam
+ai: sure i will remember your name! so planning a trip to tamil nadu??
+user: what is my name 
+ai: you told me before your name is amit am i right?
+
+
+also when the user asks a question or somehting see the chat history and get ur answer then say it
+
+try to align the chat hisroty using indexes same like prevMsg[0]: userinput and aiMsg[0] = aioutput
+
 `
 
     const message = [
@@ -133,34 +149,34 @@ strictly dont bring or talk about previous chats until and unless user asks or i
         const text = parsed.response;
 
 
-        // read the user data
-        const usersData = fs.readFileSync(path, 'utf-8');
-        // find the user
-        const users = JSON.parse(usersData);
-        const user = users.find(u => u.uniqueId === uniqueId);
+        // // read the user data
+        // const usersData = fs.readFileSync(path, 'utf-8');
+        // // find the user
+        // const users = JSON.parse(usersData);
+        // const user = users.find(u => u.uniqueId === uniqueId);
 
-        if (text === null || text === undefined){
+        if (text === null || text === undefined) {
             return "Small issue da, server acting up 😅. Try again in a bit!";
 
         } else {
             if (user) {
-            //     // Make sure aiMsg array exists
-            if (!Array.isArray(user.aiMsg)) {
-                user.aiMsg = [];
+               // Make sure aiMsg array exists
+                if (!Array.isArray(user.aiMsg)) {
+                    user.aiMsg = [];
+                }
+
+                // Push the new response
+                user.aiMsg.push(text);
+
+                // Save the updated users array back to file
+                fs.writeFileSync(path, JSON.stringify(users, null, 2), 'utf-8');
+            } else {
+                console.log("✅💔user not found")
             }
+            console.log(`Response 🤖: ${text}`)
 
-            //     // Push the new response
-            user.aiMsg.push(text);
 
-            //     // Save the updated users array back to file
-            fs.writeFileSync(path, JSON.stringify(users, null, 2), 'utf-8');
-        } else {
-            console.log("✅💔user not found")
-        }
-        console.log(`Response 🤖: ${text}`)
-
-       
-        return text
+            return text
         }
     } catch (error) {
         console.error('AI Error:', error.response?.data || error.message);

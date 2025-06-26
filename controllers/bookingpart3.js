@@ -4,7 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const { addOwner, removeOwner, getAllOwners, getActiveBookings } = require('../sessions/sessionManager');
 
-const ADMIN_NUMBERS = ['+919790294221', '9790294221', '+91 9790294221', '919790294221']; // Add your admin numbers here
+const ADMIN_NUMBERS = ['+919790294221', '9790294221', '+91 9790294221', '919790294221', '916003160229']; // Add your admin numbers here
 
 const handleAdminCommand = async (message, sender) => {
     if (!ADMIN_NUMBERS.includes(sender)) {
