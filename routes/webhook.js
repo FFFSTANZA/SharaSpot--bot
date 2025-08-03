@@ -222,7 +222,7 @@ router.post('/', async (req, res) => {
 
         // Mode switching
         if (lowerCaseMessage === 'hi' || lowerCaseMessage === 'talk') {
-            setUserMode(userId, 'AI');
+            await setUserMode(userId, 'AI');
             const reply1 = buildResponseMessage(
                'AI',
                `Welcome to SharaSpot!\nWherever you drive, Park Nearby.\n\nType "Book" to reserve your parking space,\nor say "Help" for guidance,\nor ask Shara AI anything for more info.\n\nPowered by Folonite.`
@@ -243,14 +243,14 @@ router.post('/', async (req, res) => {
         }
 
         if (lowerCaseMessage === 'book') {
-            setUserMode(userId, 'PARKING');
+            await setUserMode(userId, 'PARKING');
             await sendWhatsAppMessage(phoneNumber, buildResponseMessage('PARKING', `You are now in Parking Mode. Let's start your reservation. \nEnter your name:`));
             return res.sendStatus(200);
         }
 
         // Status command
         if (lowerCaseMessage === 'status') {
-            const currentMode = getUserMode(userId);
+            const currentMode = await getUserMode(userId);
             if (currentMode === 'OWNER') {
                 const ownerReply = await handle_owner_commands(userId, lowerCaseMessage);
                 await sendWhatsAppMessage(phoneNumber, ownerReply);
@@ -263,7 +263,7 @@ router.post('/', async (req, res) => {
 
         // Help command
         if (lowerCaseMessage === 'help') {
-            const currentMode = getUserMode(userId);
+            const currentMode = await getUserMode(userId);
             let helpText = '';
 
             if (currentMode === 'OWNER') {
@@ -279,7 +279,7 @@ router.post('/', async (req, res) => {
         }
 
         // Process messages based on current mode
-        const currentMode = getUserMode(userId);
+        const currentMode = await getUserMode(userId);
         const messageId = messageObj.id;
 
         if (currentMode === 'AI') {

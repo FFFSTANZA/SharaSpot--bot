@@ -1,10 +1,9 @@
-const TIMEOUT_LIMIT = 300000; // 5 minutes timeout
+const TIMEOUT_LIMIT = 300000; // 5 minutes
 const {
     getUserBooking,
     setUserBooking,
     getUserMode,
     setUserMode,
-    findAvailableSlot,
     markSlotBooked
 } = require('../sessions/sessionManager');
 const { resolveTextLocation } = require('../utils/locationResolver');
@@ -14,12 +13,10 @@ const fs = require('fs');
 const path = require('path');
 const { normalizePhone } = require('../utils/normalizePhone');
 
-// Cached owners data for faster access
 let cachedOwners = [];
 let lastOwnersUpdate = 0;
-const OWNERS_CACHE_TTL = 30000; // 30 seconds cache
+const OWNERS_CACHE_TTL = 30000;
 
-// Booking flow states
 const BOOKING_STATES = {
     START: 1,
     GET_PHONE_VEHICLE: 2,
@@ -27,11 +24,10 @@ const BOOKING_STATES = {
     CONFIRM_BOOKING: 4
 };
 
-
 const VEHICLE_TYPES = [
     {
         type: 'two-wheeler',
-        aliases: ['bike', 'scooter', '2 wheeler', 'two wheeler', 'bike', 'scooty'],
+        aliases: ['bike', 'scooter', '2 wheeler', 'two wheeler', 'scooty'],
         priority: 1
     },
     {
@@ -49,7 +45,7 @@ const VEHICLE_TYPES = [
         aliases: ['van', 'minivan', 'traveller'],
         priority: 4
     }
-].sort((a, b) => b.priority - a.priority); // Sort by priority for better matching
+].sort((a, b) => b.priority - a.priority);
 
 function generateBookingTicket(booking, owner) {
     const ticketId = `TKT-${Date.now().toString().slice(-6)}`;
@@ -72,7 +68,6 @@ function generateBookingTicket(booking, owner) {
 }
 
 async function getAllOwners() {
-    // Use cached data if available and fresh
     if (Date.now() - lastOwnersUpdate < OWNERS_CACHE_TTL && cachedOwners.length > 0) {
         return cachedOwners;
     }
@@ -93,7 +88,6 @@ async function findAvailableOwner(vehicleType, destination) {
     let nearestOwner = null;
     let minDistance = Infinity;
 
-    // Use for-of loop for better async handling if needed
     for (const owner of owners) {
         if (owner.status === 'active' && owner.availableVehicleTypes?.includes(vehicleType)) {
             const distance = haversine(destination.lat, destination.lon, owner.lat, owner.lon);
@@ -104,20 +98,28 @@ async function findAvailableOwner(vehicleType, destination) {
         }
     }
 
-    return nearestOwner 
+    return nearestOwner
         ? { owner: nearestOwner, status: 'found', distance: minDistance }
         : { owner: null, status: 'noNearbyOwner' };
 }
 
 async function handleBooking(userId, incomingMessage) {
     const startTime = Date.now();
-    let booking = getUserBooking(userId) || {};
     const message = incomingMessage.trim();
-    
-    // Session timeout check
+
+    if (['exit', 'cancel', 'stop'].includes(message.toLowerCase())) {
+        cleanupSession(userId);
+        return '🚫 Booking cancelled. Type *Book* if you change your mind!';
+    }
+
+    let booking = getUserBooking(userId);
+    if (!booking || typeof booking !== 'object') {
+        booking = { step: BOOKING_STATES.START };
+    }
+
     if (isSessionExpired(booking)) {
         cleanupSession(userId);
-        return '⌛ Session expired. Please type *Book* to start fresh.';
+        return '⌛ Session expired. Please type *Book* to start again.';
     }
 
     booking.lastInteractionTime = Date.now();
@@ -127,187 +129,163 @@ async function handleBooking(userId, incomingMessage) {
         switch (booking.step || BOOKING_STATES.START) {
             case BOOKING_STATES.START:
                 return handleStartState(userId, message, booking);
-                
             case BOOKING_STATES.GET_PHONE_VEHICLE:
                 return handlePhoneVehicleState(userId, message, booking);
-                
             case BOOKING_STATES.GET_DESTINATION:
                 return await handleDestinationState(userId, message, booking);
-                
             case BOOKING_STATES.CONFIRM_BOOKING:
-                const result = await handleConfirmationState(userId, booking);
-                console.log(`Booking completed in ${Date.now() - startTime}ms`);
-                return result;
-                
+                return await handleConfirmationState(userId, message, booking, startTime);
             default:
                 cleanupSession(userId);
-                return '❌ Oops! Something went wrong. Type *Book* to restart.';
+                return '❌ Unknown state. Please type *Book* to start again.';
         }
-    } catch (error) {
-        console.error('Booking error:', error);
+    } catch (err) {
+        console.error('Booking flow error:', err);
         cleanupSession(userId);
-        return '❌ We hit a snag. Please type *Book* to try again.';
+        return '❌ Something went wrong. Please type *Book* to start again.';
     }
 }
 
-// State handlers with improved validation
 function handleStartState(userId, message, booking) {
-    if (!message.trim()) return '👋 Welcome to SharaSpot! What\'s your name?';
-    
-    if (message.length > 50) {
-        return 'Please enter a shorter name (under 50 characters)';
-    }
+    const name = message.trim();
+    if (!name || name.length < 2) return '👋 Please enter your name (at least 2 characters).';
+    if (name.length > 50) return '⚠️ Please enter a shorter name (under 50 characters).';
 
-    booking.name = message.trim();
+    booking.name = name;
     booking.step = BOOKING_STATES.GET_PHONE_VEHICLE;
     setUserBooking(userId, booking);
-    return `👍 Got your name, ${booking.name}!
 
-    Now, please share your:
-    📱 *Phone Number*  
-    🚗 *Vehicle Type(s)*
-    For example:  
-    _9876543210, car, van, scooty_`;
-
+    return `👍 Got your name, *${booking.name}*!\n\nNow, send your:\n📱 *Phone Number*\n🚗 *Vehicle Type*\n\nExample:\n_9876543210, car_`;
 }
 
 function handlePhoneVehicleState(userId, message, booking) {
-    const [phonePart, ...vehicleParts] = message.split(',').map(p => p.trim());
-    const vehiclePart = vehicleParts.join(','); // Handle commas in vehicle type
-    
+    if (!booking.name) return '⚠️ Session error. Please type *Book* to start again.';
+
+    const [phonePart, ...vehicleParts] = message.split(/[,|;]/).map(p => p.trim());
+    const vehiclePart = vehicleParts.join(', ');
+
     if (!phonePart || !vehiclePart) {
-        return '⚠️ Please include both:\n- Your phone number\n- Vehicle type\nExample: _9876543210, car_';
+        return '⚠️ Please enter both phone and vehicle type:\nExample: _9876543210, car_';
     }
-    
+
     const phone = normalizePhone(phonePart);
     if (!isValidPhone(phone)) {
-        return '📱 Please enter a valid 10-digit Indian phone number';
+        return '📵 Invalid phone number. Please enter a valid 10-digit Indian mobile number.';
     }
-    
+
     const vehicleType = matchVehicleType(vehiclePart.toLowerCase());
     if (!vehicleType) {
-        return `🚗 We support these vehicle types:\n${VEHICLE_TYPES.map(v => `- ${v.type}`).join('\n')}\n\nPlease choose one`;
+        return `🚗 Supported vehicle types:\n${VEHICLE_TYPES.map(v => `- ${v.type}`).join('\n')}\n\nPlease enter one of these.`;
     }
-    
-    booking.phone = `+91${phone}`; // Store with country code
+
+    booking.phone = `+91${phone}`;
     booking.vehicleType = vehicleType;
     booking.step = BOOKING_STATES.GET_DESTINATION;
     setUserBooking(userId, booking);
-    
-    return `📍 Where are you heading? Please:\n• Type an address\n• Or share your location`;
+
+    return `🗺️ Where are you heading?\n• Type an address\n• Or share your live location`;
 }
 
 async function handleDestinationState(userId, message, booking) {
-    if (!message) return '📍 Please share your destination location';
-    
+    if (!message) return '📍 Please share your destination.';
+
     try {
         const locationData = await resolveTextLocation(message);
         if (!locationData) {
-            return '❌ Couldn\'t find that location. Try being more specific or share your GPS location.';
+            return '❌ Couldn’t find that location. Try sharing your live location or be more specific.';
         }
-        
+
         booking.destination = message;
         booking.destinationLat = locationData.lat;
         booking.destinationLon = locationData.lon;
         booking.step = BOOKING_STATES.CONFIRM_BOOKING;
         setUserBooking(userId, booking);
-        
-        return `🔍 Finding parking near ${truncate(message, 30)}...`;
-    } catch (error) {
-        console.error('Location error:', error);
-        return '❌ Error processing location. Please try again.';
+
+        return `✅ Got your destination!\n\n📋 *Confirm your booking:*\n\n👤 Name: ${booking.name}\n📞 Phone: ${booking.phone}\n🚗 Vehicle: ${booking.vehicleType}\n📍 Destination: ${truncate(message, 30)}\n\nReply *Confirm* to proceed or *Exit* to cancel.`;
+    } catch (err) {
+        console.error('Destination error:', err);
+        return '❌ Error finding location. Please try again.';
     }
 }
 
-async function handleConfirmationState(userId, booking) {
+async function handleConfirmationState(userId, message, booking, startTime) {
+    const confirmText = message.trim().toLowerCase();
+
+    if (confirmText !== 'confirm') {
+        return '❓ Please type *Confirm* to proceed or *Exit* to cancel.';
+    }
+
     try {
         const result = await processBooking(userId, booking);
+        console.log(`Booking completed in ${Date.now() - startTime}ms`);
         cleanupSession(userId);
         return result;
-    } catch (error) {
-        console.error('Confirmation error:', error);
+    } catch (err) {
+        console.error('Confirmation error:', err);
         cleanupSession(userId);
-        return '❌ Failed to complete booking. Please try again.';
+        return '❌ Booking failed. Please try again.';
     }
 }
 
-// Core booking processor
 async function processBooking(userId, booking) {
-    const searchStart = Date.now();
     const result = await findAvailableOwner(booking.vehicleType, {
         lat: booking.destinationLat,
         lon: booking.destinationLon
     });
 
-    console.log(`Owner search took ${Date.now() - searchStart}ms`);
-
     if (!result.owner) {
         return result.status === 'noNearbyOwner'
-            ? `No parking within 1km of ${truncate(booking.destination, 20)}.\nTry another location.`
-            : '😔 No parking owners available currently. Try again later.';
+            ? `❌ No parking found within 1km of ${truncate(booking.destination, 20)}.\nTry a different location.`
+            : '😔 No parking owners available right now. Please try again later.';
     }
 
     const slotNumber = findAvailableSlot(result.owner.phone);
     if (!slotNumber) {
-        return `🅿️ ${result.owner.name || 'This location'} has no available slots. Try again later.`;
+        return `🅿️ ${result.owner.name || 'This location'} has no available slots. Try later.`;
     }
 
-    // Finalize booking
     booking.slotNumber = slotNumber;
     booking.confirmed = true;
     booking.assignedOwner = result.owner.phone;
-    
+
     const ticket = generateBookingTicket(booking, result.owner);
     await sendConfirmationMessages(userId, result.owner.phone, ticket);
-    
-    markSlotBooked(result.owner.phone, slotNumber);
-    
-    return `✅ occupied! Slot ${slotNumber} at ${result.owner.name || 'your location'}.\n${ticket.slip}`;
+    await markSlotBooked(result.owner.phone, slotNumber);
+
+    return `✅ Booking Confirmed!\n\n${ticket.slip}`;
 }
 
-// Helper functions
 async function sendConfirmationMessages(userId, ownerPhone, ticket) {
     try {
         await Promise.all([
-            sendWhatsAppMessage(userId, `🅿️ ${ticket.slip}`),
-            sendWhatsAppMessage(
-                ownerPhone,
-                `📥 New Booking!\n${ticket.slip}\n\nUser will arrive soon.`
-            )
+            sendWhatsAppMessage(userId, ticket.slip),
+            sendWhatsAppMessage(ownerPhone, `📥 New Booking Received!\n${ticket.slip}`)
         ]);
-    } catch (error) {
-        console.error('Message send error:', error);
-        // Don't fail the booking if messages fail
+    } catch (err) {
+        console.error('Error sending messages:', err);
     }
 }
 
-
-
 function isValidPhone(phone) {
-    return /^[6-9]\d{9}$/.test(phone); // Valid Indian mobile number
+    return /^[6-9]\d{9}$/.test(phone);
 }
 
 function matchVehicleType(input) {
-    // Check for exact matches first
     for (const vehicle of VEHICLE_TYPES) {
-        if (vehicle.aliases.some(a => a === input.toLowerCase())) {
+        if (vehicle.aliases.includes(input)) {
             return vehicle.type;
         }
     }
-    
-    // Then check partial matches
     for (const vehicle of VEHICLE_TYPES) {
-        if (vehicle.aliases.some(a => input.toLowerCase().includes(a))) {
+        if (vehicle.aliases.some(alias => input.includes(alias))) {
             return vehicle.type;
         }
     }
-    
     return null;
 }
 
 function isSessionExpired(booking) {
-    return booking.lastInteractionTime && 
-           Date.now() - booking.lastInteractionTime > TIMEOUT_LIMIT;
+    return booking.lastInteractionTime && Date.now() - booking.lastInteractionTime > TIMEOUT_LIMIT;
 }
 
 function cleanupSession(userId) {
@@ -328,12 +306,12 @@ module.exports = {
     },
     getUserBookingStatus: (userId) => {
         const booking = getUserBooking(userId);
-        if (!booking) return 'No active booking. Type *Book* to start.';
-        
-        return `📱 Your Booking:\n` +
-               `Status: ${booking.confirmed ? '✅ Confirmed' : '🔄 In Progress'}\n` +
-               `${booking.destination ? `📍 ${truncate(booking.destination, 30)}\n` : ''}` +
-               `${booking.slotNumber ? `🅿️ Slot ${booking.slotNumber}\n` : ''}`;
+        if (!booking) return '📭 No active booking.\nType *Book* to start a new one.';
+
+        return `📱 *Your Booking:*\n` +
+            `Status: ${booking.confirmed ? '✅ Confirmed' : '🔄 In Progress'}\n` +
+            `${booking.destination ? `📍 ${truncate(booking.destination, 30)}\n` : ''}` +
+            `${booking.slotNumber ? `🅿️ Slot ${booking.slotNumber}\n` : ''}`;
     },
     refreshOwnersCache: () => {
         lastOwnersUpdate = 0;

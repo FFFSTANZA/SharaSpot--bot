@@ -324,6 +324,40 @@ async function check_and_switch_to_owner_mode(userId) {
     };
   }
 }
+async function markSlotBooked(ownerPhone, slotIndex) {
+    const ownerSession = getSession(ownerPhone);
+
+    if (!ownerSession || !ownerSession.slots || !ownerSession.slots[slotIndex]) {
+        console.error(`❌ Slot not found or session invalid for owner ${ownerPhone}, index ${slotIndex}`);
+        return false;
+    }
+
+    // Update session
+    ownerSession.slots[slotIndex].state = 'booked';
+    ownerSession.slots[slotIndex].is_occupied = true;
+    ownerSession.slots[slotIndex].last_status_change = new Date();
+
+    // Persist in database
+    try {
+        await db
+            .update(slots)
+            .set({
+                state: 'booked',
+                is_occupied: true,
+                last_status_change: new Date(),
+            })
+            .where(and(
+                eq(slots.owner_id, ownerPhone),
+                eq(slots.index, slotIndex)
+            ));
+
+        console.log(`✅ Slot ${slotIndex} for owner ${ownerPhone} marked as booked in DB.`);
+        return true;
+    } catch (err) {
+        console.error(`❌ Failed to update slot in DB for ${ownerPhone}, index ${slotIndex}:`, err);
+        return false;
+    }
+}
 
 module.exports = {
   normalizePhone,
@@ -339,5 +373,6 @@ module.exports = {
   updateSlotState,
   setPendingAction,
   getPendingAction,
-  check_and_switch_to_owner_mode
+  check_and_switch_to_owner_mode,
+  markSlotBooked
 };
