@@ -6,7 +6,7 @@ const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 
 async function sendWhatsAppMessage(to, message) {
     try {
-        const url = `https://graph.facebook.com/v17.0/${PHONE_NUMBER_ID}/messages`;
+        const url = `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`;
 
         const payload = {
             messaging_product: 'whatsapp',
@@ -27,4 +27,35 @@ async function sendWhatsAppMessage(to, message) {
     }
 }
 
-module.exports = { sendWhatsAppMessage };
+
+// create typing indicator
+
+async function sendTyping(msgId) {
+     try {
+        const url = `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`;
+
+        const payload = {
+            messaging_product: 'whatsapp',
+            status: "read",
+            message_id: msgId,
+            typing_indicator: {
+                type: "text"
+            }
+        };
+
+        const response = await axios.post(url, payload, {
+            headers: {
+                'Authorization': `Bearer ${WHATSAPP_TOKEN}`,
+                'Content-Type': 'application/json',
+            },
+        });
+
+        console.log('✅ Typing indicator sent:', response.data);
+    } catch (error) {
+        console.error('❌ Failed to send typing:', error.response?.data || error.message);
+    }
+}
+
+
+
+module.exports = { sendWhatsAppMessage, sendTyping };
