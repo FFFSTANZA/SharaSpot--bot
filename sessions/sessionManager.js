@@ -14,9 +14,8 @@ const sessions = {};
 // Helper to resolve session ID (based on normalized phone number)
 async function getSessionId(userId) {
   const user = await get_user_by_id(userId);
-  return user?.number ? normalizePhone(user.number) : null;
+  return user?.number ? normalizePhone(user.number) : userId; // Fallback to userId if no number
 }
-
 async function getUserMode(userId) {
   const id = await getSessionId(userId);
   return sessions[id]?.mode || 'AI';
@@ -197,52 +196,41 @@ async function updateOwnerLocation(userId, textLocation) {
 }
 
 // Always update session after changing slots
-async function addSlotsToOwner(userId, slotList = []) {
-  const id = await getSessionId(userId);
-  if (!id) return false;
-
+async function addSlotsToOwner(ownerId, slotArray) {
   try {
-    const [owner] = await db
+    if (!ownerId || !Array.isArray(slotArray)) throw new Error('Invalid slot input');
+
+    const existingSlots = await db
       .select()
-      .from(owners)
-      .where(eq(owners.phone_num, id))
-      .limit(1);
+      .from(slots)
+      .where(eq(slots.owner_id, ownerId));
 
-    if (!owner) return false;
+    const existingIndices = new Set(existingSlots.map(s => s.index));
 
-    // Delete existing slots
-    await db.delete(slots).where(eq(slots.owner_id, owner.id));
+    const newSlotData = slotArray.map((slot, i) => {
+      const index = slot.index ?? i;
+      if (existingIndices.has(index)) {
+        throw new Error(`Slot index ${index} already exists for this owner`);
+      }
 
-    // Format new slots
-    const formattedSlots = slotList.map((slot, i) => ({
-      owner_id: owner.id,
-      index: slot.index ?? i,
-      type: slot.type ?? 'Two-wheeler',
-      state: slot.state ?? 'available',
-      is_occupied: false,
-      connected_to: null,
-      notes: ''
-    }));
+      // ✅ FORCE the correct ID format: ${ownerId}-${index}
+      return {
+        id: `${ownerId}-${index}`,           // ← Add this line
+        owner_id: ownerId,
+        index,
+        type: slot.type ?? 'Two-wheeler',
+        state: slot.state ?? 'available',
+        is_occupied: slot.isOccupied ?? false,
+        connected_to: slot.connectedTo ?? null,
+        notes: slot.notes ?? ''
+      };
+    });
 
-    // Insert new slots
-    await db.insert(slots).values(formattedSlots);
-
-    // Update total_slots in owners table
-    await db
-      .update(owners)
-      .set({
-        total_slots: formattedSlots.length,
-        last_updated: new Date()
-      })
-      .where(eq(owners.id, owner.id));
-
-    // Refresh session
-    await getOwnerData(userId, true);
-
+    await db.insert(slots).values(newSlotData);
     return true;
-  } catch (err) {
-    console.error('addSlotsToOwner error:', err);
-    return false;
+  } catch (error) {
+    console.error(`❌ Failed to add slots to owner "${ownerId}":`, error);
+    throw error;
   }
 }
 
@@ -324,41 +312,37 @@ async function check_and_switch_to_owner_mode(userId) {
     };
   }
 }
-async function markSlotBooked(ownerPhone, slotIndex) {
-    const ownerSession = getSession(ownerPhone);
 
-    if (!ownerSession || !ownerSession.slots || !ownerSession.slots[slotIndex]) {
-        console.error(`❌ Slot not found or session invalid for owner ${ownerPhone}, index ${slotIndex}`);
-        return false;
+async function markSlotBooked(ownerId, slotIndex) {
+  try {
+    const result = await db
+      .update(slots)
+      .set({
+        state: 'occupied',
+        is_occupied: true,
+        last_status_change: new Date()
+      })
+      .where(and(
+        eq(slots.owner_id, ownerId),
+        eq(slots.index, slotIndex)
+      ));
+
+    // Update session cache if exists
+    const sessionId = normalizePhone(ownerId);
+    if (sessions[sessionId]?.ownerData?.slots) {
+      const slot = sessions[sessionId].ownerData.slots.find(s => s.index === slotIndex);
+      if (slot) {
+        slot.state = 'occupied';
+        slot.is_occupied = true;
+      }
     }
 
-    // Update session
-    ownerSession.slots[slotIndex].state = 'booked';
-    ownerSession.slots[slotIndex].is_occupied = true;
-    ownerSession.slots[slotIndex].last_status_change = new Date();
-
-    // Persist in database
-    try {
-        await db
-            .update(slots)
-            .set({
-                state: 'booked',
-                is_occupied: true,
-                last_status_change: new Date(),
-            })
-            .where(and(
-                eq(slots.owner_id, ownerPhone),
-                eq(slots.index, slotIndex)
-            ));
-
-        console.log(`✅ Slot ${slotIndex} for owner ${ownerPhone} marked as booked in DB.`);
-        return true;
-    } catch (err) {
-        console.error(`❌ Failed to update slot in DB for ${ownerPhone}, index ${slotIndex}:`, err);
-        return false;
-    }
+    return result.rowCount > 0;
+  } catch (err) {
+    console.error('markSlotBooked error:', err);
+    return false;
+  }
 }
-
 module.exports = {
   normalizePhone,
   getUserMode,

@@ -1,60 +1,62 @@
+// Enhanced Parking Booking System (Neon HTTP Compatible) - FIXED & OPTIMIZED
 const TIMEOUT_LIMIT = 300000; // 5 minutes
+const RESERVATION_EXPIRY_MS = 60000; // 1 minute reservation window
 const {
   getUserBooking,
   setUserBooking,
   getUserMode,
-  setUserMode,
-  markSlotBooked
+  setUserMode
 } = require('../sessions/sessionManager');
 const { sendWhatsAppMessage } = require('../services/whatsappService');
 const { normalizePhone } = require('../utils/normalizePhone');
 const { getOwnerByPhone } = require('../lib/ownerDb');
 const { db } = require('../database/db');
-const { owners, ownerVehicleTypes, slots } = require('../database/schema');
-const { eq, and, or } = require('drizzle-orm');
+const { owners, ownerVehicleTypes, slots, bookings } = require('../database/schema');
+const { eq, and, or, isNull, lt, gte } = require('drizzle-orm');
 const Fuse = require('fuse.js');
 const { v4: uuidv4 } = require('uuid');
 
 // Constants
 const OWNERS_CACHE_TTL = 30000;
-const MAX_SLOT_CHECK_ATTEMPTS = 3;
-const BOOKING_RETRY_DELAY = 500; // ms
-const MAX_BOOKING_ATTEMPTS = 3;
-const SLOT_LOCK_TIMEOUT = 10000; // 10 seconds
-
+const MAX_SLOT_CHECK_ATTEMPTS = 5;
+const BOOKING_RETRY_DELAY = 1000;
+const MAX_BOOKING_RETRIES = 5;
+const SLOT_LOCK_TIMEOUT = 15000;
 const BOOKING_STATES = {
   START: 1,
   GET_PHONE_VEHICLE: 2,
   GET_DESTINATION: 3,
-  CONFIRM_BOOKING: 4,
-  PAYMENT: 5,
-  COMPLETE: 6
+  CONFIRM_BOOKING: 4
 };
 
 const VEHICLE_TYPES = [
   { 
-    type: 'two-wheeler', 
+    type: 'Two-wheeler', 
     aliases: ['bike', 'scooter', '2 wheeler', 'two wheeler', 'scooty'], 
     priority: 1,
-    basePrice: 20
+    icon: '🛵',
+    slotPrefix: 'M'
   },
   { 
     type: '4-seat car', 
     aliases: ['car', 'sedan', 'hatchback', '4 seater', '4-seater', 'normal car'], 
     priority: 2,
-    basePrice: 50
+    icon: '🚗',
+    slotPrefix: 'C'
   },
   { 
     type: '8-seat car', 
     aliases: ['suv', 'xl', '8 seater', '8-seater', 'big car'], 
     priority: 3,
-    basePrice: 80
+    icon: '🚙',
+    slotPrefix: 'L'
   },
   { 
-    type: 'van', 
+    type: 'Van', 
     aliases: ['van', 'minivan', 'traveller'], 
     priority: 4,
-    basePrice: 100
+    icon: '🚐',
+    slotPrefix: 'V'
   }
 ].sort((a, b) => b.priority - a.priority);
 
@@ -81,66 +83,72 @@ function isValidPhone(phone) {
 
 function matchVehicleType(input) {
   if (!input) return null;
-  
   const lowerInput = input.toLowerCase();
-  for (const vehicle of VEHICLE_TYPES) {
-    if (vehicle.aliases.some(alias => lowerInput.includes(alias))) {
-      return vehicle.type;
-    }
-  }
-  return null;
+  return VEHICLE_TYPES.find(vehicle => 
+    vehicle.aliases.some(alias => lowerInput.includes(alias))
+  )?.type || null;
 }
 
 function generateBookingTicket(booking, owner) {
-  const ticketId = `TKT-${Date.now().toString().slice(-6)}`;
-  const price = calculatePrice(booking.vehicleType, booking.duration);
-  
+  const vehicleInfo = VEHICLE_TYPES.find(v => v.type === booking.vehicleType) || {};
+  const slotDisplay = booking.slotNumber ? `${vehicleInfo.slotPrefix || ''}${booking.slotNumber}` : 'Not assigned';
   return {
-    id: ticketId,
-    slip: `\n🎫 *Parking Ticket Confirmed* 🅿️\n━━━━━━━━━━━━━━━━━━━━\n🆔 ${ticketId}\n👤 ${booking.name}\n📞 ${booking.phone}\n🚗 ${booking.vehicleType}\n📍 ${booking.destination}\n⏱️ Duration: ${booking.duration || '1 hour'}\n💰 Price: ₹${price}\n🕒 ${new Date().toLocaleString()}\n🅿️ Slot ${booking.slotNumber}\n👷 ${owner.name || owner.phone_num}\n━━━━━━━━━━━━━━━━━━━━\nℹ️ Present this ticket on arrival`,
-    price
+    id: booking.bookingId,
+    slip: `
+🎫 *Parking Ticket Confirmed* 🅿️
+━━━━━━━━━━━━━━━━━━━━
+🆔 ${booking.bookingId}
+👤 ${booking.name}
+📞 ${booking.phone}
+${vehicleInfo.icon || '🚗'} ${booking.vehicleType}
+📍 ${booking.destination}
+🕒 ${new Date().toLocaleString()}
+🅿️ Slot ${slotDisplay}
+👷 ${owner.name || owner.phone_num}
+━━━━━━━━━━━━━━━━━━━━
+ℹ️ Present this ticket on arrival`
   };
 }
 
-function calculatePrice(vehicleType, duration = '1 hour') {
-  const hours = duration.includes('hour') ? 
-    parseInt(duration) : 
-    Math.ceil(parseInt(duration) / 60);
-  const vehicle = VEHICLE_TYPES.find(v => v.type === vehicleType);
-  return (vehicle?.basePrice || 50) * Math.max(1, hours);
+// ✅ Ensure slot exists and create if missing (optional safety)
+async function ensureSlotExists(ownerId, vehicleType, index) {
+  const slotId = `${ownerId}-${index}`;
+  const [existing] = await db.select().from(slots).where(eq(slots.id, slotId));
+  if (existing) return existing;
+
+  // Create slot if not exists
+  await db.insert(slots).values({
+    id: slotId,
+    owner_id: ownerId,
+    index: index,
+    type: vehicleType,
+    state: 'available',
+    is_occupied: false,
+    created_at: new Date(),
+    last_updated: new Date()
+  });
+  console.log(`✅ Created missing slot: ${slotId}`);
+  return { id: slotId, index };
 }
 
 // Core Booking Functions
 async function findAvailableOwner(vehicleType, destinationText) {
   try {
-    const dbOwners = await db.select().from(owners)
-      .where(eq(owners.is_active, true));
-    
+    const dbOwners = await db.select().from(owners).where(eq(owners.is_active, true));
     const owner = fuzzyMatchOwnerLocation(destinationText, dbOwners);
-    
-    if (!owner || typeof owner.lat !== 'number' || typeof owner.lon !== 'number') {
-      console.log('Owner validation failed:', { 
-        exists: !!owner, 
-        hasCoords: !!(owner?.lat && owner?.lon) 
-      });
+    if (!owner || !owner.is_active || typeof owner.lat !== 'number' || typeof owner.lon !== 'number') {
       return { owner: null, status: 'noNearbyOwner' };
     }
 
-    const types = await db
-      .select()
+    const types = await db.select()
       .from(ownerVehicleTypes)
       .where(eq(ownerVehicleTypes.owner_id, owner.id));
-    
+
     const vehicleTypes = types.map(t => t.vehicle_type.toLowerCase());
-    
     if (vehicleTypes.length > 0 && !vehicleTypes.includes(vehicleType.toLowerCase())) {
-      console.log('Vehicle type mismatch:', {
-        ownerTypes: vehicleTypes,
-        requested: vehicleType.toLowerCase()
-      });
-      return { owner: null, status: 'noNearbyOwner' };
+      return { owner: null, status: 'vehicleTypeNotSupported' };
     }
-     
+
     return { owner, status: 'found', distance: 0 };
   } catch (err) {
     console.error("Error in findAvailableOwner:", err);
@@ -157,120 +165,106 @@ function fuzzyMatchOwnerLocation(inputText, ownerList) {
     ignoreLocation: true,
     shouldSort: true
   });
-
   const results = fuse.search(inputText.trim().toLowerCase());
   return results.length ? results[0].item : null;
 }
 
-async function findAvailableSlot(ownerId, vehicleType, attempt = 1) {
+// ✅ Fixed: Returns full slot object (with .id), not just index
+async function findAndLockSlot(ownerId, vehicleType) {
+  const lockKey = `${ownerId}-${vehicleType}`;
+  if (bookingLocks.has(lockKey)) {
+    throw new Error('Slot selection in progress');
+  }
+  bookingLocks.set(lockKey, true);
+
   try {
-    const availableSlots = await db.select()
+    // Find available slot
+    const availableSlot = await db.select()
       .from(slots)
       .where(
         and(
           eq(slots.owner_id, ownerId),
           eq(slots.type, vehicleType),
-          or(
-            eq(slots.state, 'available'),
-            eq(slots.is_occupied, false)
-          )
+          eq(slots.state, 'available')
         )
       )
-      .orderBy(slots.index) // Get lowest numbered slot first
       .limit(1);
 
-    if (availableSlots.length > 0) {
-      return availableSlots[0].index;
+    if (availableSlot.length > 0) {
+      const slot = availableSlot[0];
+      // Update to occupied
+      await db.update(slots)
+        .set({ 
+          state: 'occupied',
+          is_occupied: true,
+          last_updated: new Date()
+        })
+        .where(eq(slots.id, slot.id));
+      return slot; // Return full slot object
     }
 
-    if (attempt < MAX_SLOT_CHECK_ATTEMPTS) {
-      await new Promise(resolve => setTimeout(resolve, BOOKING_RETRY_DELAY));
-      return await findAvailableSlot(ownerId, vehicleType, attempt + 1);
+    // Check for expired reservations
+    const expiredReservation = await db.select()
+      .from(slots)
+      .where(
+        and(
+          eq(slots.owner_id, ownerId),
+          eq(slots.type, vehicleType),
+          eq(slots.state, 'occupied'),
+          lt(slots.last_updated, new Date(Date.now() - RESERVATION_EXPIRY_MS))
+        )
+      )
+      .limit(1);
+
+    if (expiredReservation.length > 0) {
+      const slot = expiredReservation[0];
+      await db.update(slots)
+        .set({ 
+          state: 'occupied',
+          is_occupied: true,
+          last_updated: new Date()
+        })
+        .where(eq(slots.id, slot.id));
+      return slot;
     }
 
     return null;
-  } catch (err) {
-    console.error('Error finding available slot:', err);
-    throw err;
-  }
-}
-
-async function bookSlotWithRetry(ownerId, slotIndex, vehicleType, retries = MAX_BOOKING_ATTEMPTS) {
-  const lockKey = `${ownerId}-${slotIndex}`;
-  const lockId = uuidv4();
-  
-  // Check for existing lock
-  if (bookingLocks.has(lockKey)) {
-    const { timestamp, id } = bookingLocks.get(lockKey);
-    // If lock is expired, clear it
-    if (Date.now() - timestamp > SLOT_LOCK_TIMEOUT) {
-      bookingLocks.delete(lockKey);
-    } else {
-      throw new Error('Slot is currently being booked by another process');
-    }
-  }
-
-  // Set new lock
-  bookingLocks.set(lockKey, { timestamp: Date.now(), id: lockId });
-
-  try {
-    // Verify slot is available
-    const [slot] = await db.select()
-      .from(slots)
-      .where(
-        and(
-          eq(slots.owner_id, ownerId),
-          eq(slots.index, slotIndex),
-          eq(slots.type, vehicleType),
-          or(
-            eq(slots.state, 'available'),
-            eq(slots.is_occupied, false)
-          )
-        )
-      );
-
-    if (!slot) {
-      throw new Error('Slot not available');
-    }
-
-    // Attempt to book
-    const result = await db.update(slots)
-      .set({ 
-        state: 'occupied',
-        is_occupied: true,
-        last_updated: new Date()
-      })
-      .where(
-        and(
-          eq(slots.owner_id, ownerId),
-          eq(slots.index, slotIndex),
-          or(
-            eq(slots.state, 'available'),
-            eq(slots.is_occupied, false)
-          )
-        )
-      );
-
-    if (result.rowCount === 0) {
-      throw new Error('Slot was booked by someone else');
-    }
-
-    return true;
-  } catch (err) {
-    if (retries > 0) {
-      await new Promise(resolve => setTimeout(resolve, BOOKING_RETRY_DELAY));
-      return await bookSlotWithRetry(ownerId, slotIndex, vehicleType, retries - 1);
-    }
-    throw err;
   } finally {
-    // Only clear our own lock
-    const currentLock = bookingLocks.get(lockKey);
-    if (currentLock && currentLock.id === lockId) {
-      bookingLocks.delete(lockKey);
-    }
+    bookingLocks.delete(lockKey);
   }
 }
 
+// ✅ Fixed: Use actual slot.id from DB
+async function createBookingRecord(userId, ownerId, slot, bookingDetails) {
+  const bookingId = `TKT-${uuidv4().slice(0, 8).toUpperCase()}`;
+  
+  await db.insert(bookings).values({
+    id: bookingId,
+    user_id: userId,
+    owner_id: ownerId,
+    slot_id: slot.id, // ✅ Use real slot.id
+    slot_number: slot.index,
+    vehicle_type: bookingDetails.vehicleType,
+    destination: bookingDetails.destination,
+    destination_lat: bookingDetails.destinationLat,
+    destination_lon: bookingDetails.destinationLon,
+    status: 'confirmed',
+    created_at: new Date(),
+    expires_at: new Date(Date.now() + 3600000) // 1 hour
+  });
+
+  return bookingId;
+}
+
+async function sendNotifications(userId, ownerPhone, ticketSlip) {
+  await Promise.all([
+    sendWhatsAppMessage(userId, ticketSlip),
+    sendWhatsAppMessage(ownerPhone, `📥 New Booking Received!
+${ticketSlip}`)
+  ]).catch(err => console.error('Notification failed:', err));
+}
+
+// ✅ Fixed: Use full slot object
 async function processBooking(userId, booking) {
   if (!booking?.matchedOwner?.phone_num) {
     throw new Error('No valid owner information in booking');
@@ -281,161 +275,156 @@ async function processBooking(userId, booking) {
     throw new Error(`Parking at ${truncate(booking.destination)} is no longer available`);
   }
 
-  // Find available slot
-  const slotNumber = await findAvailableSlot(owner.id, booking.vehicleType);
-  if (slotNumber === null) {
+  let slot = null;
+  let attempts = 0;
+
+  while (attempts < MAX_BOOKING_RETRIES) {
+    try {
+      slot = await findAndLockSlot(owner.id, booking.vehicleType);
+      if (slot) break;
+      attempts++;
+      if (attempts < MAX_BOOKING_RETRIES) {
+        await new Promise(resolve => setTimeout(resolve, BOOKING_RETRY_DELAY));
+      }
+    } catch (err) {
+      console.error(`Slot assignment attempt ${attempts + 1} failed:`, err);
+      attempts++;
+      if (attempts >= MAX_BOOKING_RETRIES) throw err;
+      await new Promise(resolve => setTimeout(resolve, BOOKING_RETRY_DELAY));
+    }
+  }
+
+  if (!slot) {
     throw new Error(`${owner.name || 'This location'} has no available ${booking.vehicleType} slots`);
   }
 
-  // Book the slot
-  try {
-    await bookSlotWithRetry(owner.id, slotNumber, booking.vehicleType);
-  } catch (err) {
-    console.error('Slot booking failed:', err);
-    throw new Error('Failed to reserve parking slot. Please try again.');
-  }
+  // ✅ Assign both index and id
+  booking.slotNumber = slot.index;
+  booking.slotId = slot.id;
 
-  // Generate ticket with price
+  booking.bookingId = await createBookingRecord(userId, owner.id, slot, booking);
   const ticket = generateBookingTicket(booking, owner);
-  
-  try {
-    // Send notifications
-    await Promise.all([
-      sendWhatsAppMessage(userId, ticket.slip),
-      sendWhatsAppMessage(owner.phone_num, `📥 New Booking Received!\n${ticket.slip}`),
-      markSlotBooked(owner.id, slotNumber)
-    ]);
 
-    // Update booking with price
-    booking.price = ticket.price;
-    booking.currency = 'INR';
-    
-    return {
-      ...booking,
-      slotNumber,
-      confirmed: true,
-      assignedOwner: owner.phone_num,
-      ticket
-    };
-  } catch (err) {
-    // Rollback slot booking if messaging fails
-    await db.update(slots)
-      .set({ 
-        state: 'available',
-        is_occupied: false
-      })
-      .where(
-        and(
-          eq(slots.owner_id, owner.id),
-          eq(slots.index, slotNumber)
-        )
-      );
-    throw new Error('Failed to complete booking. Please try again.');
-  }
+  sendNotifications(userId, owner.phone_num, ticket.slip);
+
+  return {
+    ...booking,
+    confirmed: true,
+    assignedOwner: owner.phone_num,
+    ticket,
+    bookingTime: new Date().toISOString()
+  };
 }
 
 // State Handlers
-function handleStartState(userId, message, booking) {
+async function handleStartState(userId, message, booking) {
   const name = message.trim();
   if (!name || name.length < 2) {
     return '👋 Please enter your name (at least 2 characters).';
   }
-  
   booking.name = name;
   booking.step = BOOKING_STATES.GET_PHONE_VEHICLE;
   setUserBooking(userId, booking);
-  return `👍 Got your name, *${name}*!\nPlease send:\n📱 Your phone number\n🚗 Your vehicle type\n\nExample: 9876543210, car`;
+
+  const vehicleOptions = VEHICLE_TYPES.map(v => `${v.icon} ${v.type}`).join('\n');
+  return `👍 Got your name, *${name}*!\nPlease send:\n📱 Your phone number\n🚗 Your vehicle type\nAvailable vehicle types:\n${vehicleOptions}\n\nExample: \`9876543210, car\``;
 }
 
-function handlePhoneVehicleState(userId, message, booking) {
+async function handlePhoneVehicleState(userId, message, booking) {
   const [phonePart, ...vehicleParts] = message.split(/[|,;]/).map(p => p.trim());
   const vehiclePart = vehicleParts.join(' ');
-  
   const phone = normalizePhone(phonePart);
+
   if (!isValidPhone(phone)) {
-    return '⚠️ Please enter a valid 10-digit Indian phone number\nExample: 9876543210, car';
+    return '⚠️ Please enter a valid 10-digit Indian phone number.\n\nExample: `9876543210, car`';
   }
-  
-  if (!vehiclePart) {
-    return '⚠️ Please specify your vehicle type\nExample: 9876543210, car';
-  }
-  
+
   const vehicleType = matchVehicleType(vehiclePart);
   if (!vehicleType) {
-    const validTypes = VEHICLE_TYPES.map(v => `- ${v.type}`).join('\n');
-    return `🚗 Please specify a valid vehicle type:\n${validTypes}\n\nExample: 9876543210, car`;
+    const validTypes = VEHICLE_TYPES.map(v => `${v.icon} - ${v.type}`).join('\n');
+    return `🚗 Please specify a valid vehicle type:\n${validTypes}\n\nExample: \`9876543210, car\``;
   }
-  
+
   booking.phone = `+91${phone}`;
   booking.vehicleType = vehicleType;
   booking.step = BOOKING_STATES.GET_DESTINATION;
   setUserBooking(userId, booking);
-  
+
   return '📍 Please send your destination (address or live location)\n\nExamples:\n- Rajapalayam bus stand\n- Near Gandhi statue\n- *Send your current location*';
 }
 
 async function handleDestinationState(userId, message, booking) {
   if (typeof message === 'object' && message.lat && message.lon) {
-    // Handle live location
     booking.destination = "Your current location";
     booking.destinationLat = message.lat;
     booking.destinationLon = message.lon;
   } else {
-    // Handle text destination
     const destinationText = message.trim();
     if (!destinationText || destinationText.length < 3) {
       return '📍 Please enter a valid destination (at least 3 characters) or send your location';
     }
-    
+
     const result = await findAvailableOwner(booking.vehicleType, destinationText);
-    
     if (!result.owner) {
-      return `❌ Couldn't find parking near "${destinationText}".\n\nPlease try:\n- A nearby landmark\n- More specific location\n- Or send your current location`;
+      const nearbyOwners = await db.select()
+        .from(owners)
+        .leftJoin(ownerVehicleTypes, eq(owners.id, ownerVehicleTypes.owner_id))
+        .where(
+          and(
+            eq(owners.is_active, true),
+            or(
+              eq(ownerVehicleTypes.vehicle_type, booking.vehicleType),
+              isNull(ownerVehicleTypes.vehicle_type)
+            )
+          )
+        )
+        .limit(3);
+
+      let suggestion = '';
+      if (nearbyOwners.length > 0) {
+        suggestion = `\n\nNearby parking locations:\n${nearbyOwners.map(o => `- ${o.owners?.location}`).join('\n')}`;
+      }
+
+      return `❌ Couldn't find parking near "${destinationText}".${suggestion}\n\nTry:\n- A nearby landmark\n- More specific location\n- Or send your current location`;
     }
-    
+
     booking.matchedOwner = result.owner;
     booking.destination = result.owner.location || destinationText;
     booking.destinationLat = result.owner.lat;
     booking.destinationLon = result.owner.lon;
   }
-  
+
   booking.step = BOOKING_STATES.CONFIRM_BOOKING;
   await setUserBooking(userId, booking);
-  
-  const price = calculatePrice(booking.vehicleType);
-  
-  return `📍 You selected: *${booking.destination}*\n\n🅿️ Parking: ${booking.matchedOwner?.name || 'Local parking'}\n🚗 Vehicle: ${booking.vehicleType}\n💰 Estimated Price: ₹${price} (1 hour)\n\nType *Confirm* to book or *Cancel* to abort`;
+
+  const vehicleInfo = VEHICLE_TYPES.find(v => v.type === booking.vehicleType) || {};
+  return `📍 You selected: *${booking.destination}*\n🅿️ Parking: ${booking.matchedOwner?.name || 'Local parking'}\n${vehicleInfo.icon || '🚗'} Vehicle: ${booking.vehicleType}\n\nType *Confirm* to book or *Cancel* to abort`;
 }
 
 async function handleConfirmationState(userId, message, booking, startTime) {
   const normalizedMessage = message.trim().toLowerCase();
-  
-  if (normalizedMessage === 'cancel') {
-    cleanupSession(userId);
-    return "🚫 Booking cancelled. You can start again by typing *Book*.";
-  }
-  
   if (normalizedMessage !== 'confirm') {
     return '❓ Please type *Confirm* to book or *Cancel* to abort';
   }
-  
+
   try {
     const result = await processBooking(userId, booking);
-    console.log(`Booking completed in ${Date.now() - startTime}ms`);
-    
-    // Move to complete state
-    result.step = BOOKING_STATES.COMPLETE;
-    setUserBooking(userId, result);
-    
-    return `✅ Booking Confirmed!\n\n${result.ticket.slip}\n\nThank you for using our service!`;
+    console.log(`✅ Booking completed in ${Date.now() - startTime}ms`);
+    cleanupSession(userId);
+    return `✅ Booking Confirmed!\n${result.ticket.slip}\n\nThank you for using our service!`;
   } catch (error) {
     console.error('Booking confirmation failed:', error);
     cleanupSession(userId);
-    
-    if (error.message.includes('no available')) {
-      return `❌ ${error.message}\n\nPlease try:\n- A different location\n- Another vehicle type\n- Or try again later`;
+
+    if (error.message.includes('currently being booked')) {
+      return `⏳ Someone is booking this slot right now. Please try again in a few seconds.`;
     }
-    
+    if (error.message.includes('was booked by someone else')) {
+      return `😞 That slot was just taken. Would you like to try another slot?`;
+    }
+    if (error.message.includes('no available')) {
+      return `🚗 No ${booking.vehicleType} slots available at ${booking.destination}.\n\nPlease try:\n- A different location\n- Another vehicle type\n- Or try again later`;
+    }
     return `❌ ${error.message || 'Booking failed. Please try again.'}`;
   }
 }
@@ -443,21 +432,17 @@ async function handleConfirmationState(userId, message, booking, startTime) {
 // Main Booking Handler
 async function handleBooking(userId, incomingMessage) {
   const startTime = Date.now();
-  const message = incomingMessage?.trim()?.toLowerCase() || '';
+  const message = incomingMessage?.trim() || '';
 
   try {
-    // Handle cancellation commands
-    if (["exit", "cancel", "stop", "abort"].some(cmd => message.startsWith(cmd))) {
+    if (["exit", "cancel", "stop", "abort"].some(cmd => message.toLowerCase().startsWith(cmd))) {
       cleanupSession(userId);
       return "🚫 Booking cancelled. You can start again by typing *Book*.";
     }
 
     let booking = await getUserBooking(userId);
     if (!booking || typeof booking !== "object") {
-      booking = { 
-        step: BOOKING_STATES.START,
-        lastInteractionTime: Date.now()
-      };
+      booking = { step: BOOKING_STATES.START, lastInteractionTime: Date.now() };
     }
 
     if (isSessionExpired(booking)) {
@@ -470,15 +455,13 @@ async function handleBooking(userId, incomingMessage) {
 
     switch (booking.step) {
       case BOOKING_STATES.START:
-        return handleStartState(userId, message, booking);
+        return await handleStartState(userId, message, booking);
       case BOOKING_STATES.GET_PHONE_VEHICLE:
-        return handlePhoneVehicleState(userId, message, booking);
+        return await handlePhoneVehicleState(userId, message, booking);
       case BOOKING_STATES.GET_DESTINATION:
         return await handleDestinationState(userId, message, booking);
       case BOOKING_STATES.CONFIRM_BOOKING:
         return await handleConfirmationState(userId, message, booking, startTime);
-      case BOOKING_STATES.COMPLETE:
-        return "✅ Your booking is already confirmed. Do you need anything else?";
       default:
         cleanupSession(userId);
         return '❌ Unknown booking state. Please type *Book* to start again.';
@@ -490,51 +473,54 @@ async function handleBooking(userId, incomingMessage) {
   }
 }
 
-// Additional Utility Functions
-async function cancelBooking(userId) {
-  const booking = await getUserBooking(userId);
-  if (!booking?.confirmed) return false;
-
-  try {
-    await db.update(slots)
-      .set({ 
-        state: 'available',
-        is_occupied: false
-      })
-      .where(
-        and(
-          eq(slots.owner_id, booking.assignedOwner),
-          eq(slots.index, booking.slotNumber)
-        )
-      );
-    
-    cleanupSession(userId);
-    return true;
-  } catch (err) {
-    console.error('Failed to cancel booking:', err);
-    return false;
-  }
+// Maintenance: Cleanup expired reservations
+async function cleanupExpiredBookings() {
+  const result = await db.update(slots)
+    .set({ 
+      state: 'available',
+      is_occupied: false,
+      last_updated: new Date()
+    })
+    .where(
+      and(
+        eq(slots.state, 'occupied'),
+        lt(slots.last_updated, new Date(Date.now() - RESERVATION_EXPIRY_MS))
+      )
+    );
+  console.log(`🧹 Cleaned up ${result.rowCount} expired slot reservations`);
+  return result.rowCount;
 }
+
+setInterval(cleanupExpiredBookings, 300000); // Every 5 minutes
 
 module.exports = {
   handleBooking,
   findAvailableOwner,
   handleConfirmationState,
-  cancelBooking,
+  handleStartState,
+  handlePhoneVehicleState,
+  handleDestinationState,
   getUserBookingStatus: async (userId) => {
     const booking = await getUserBooking(userId);
     if (!booking) return '📭 No active booking found.';
-    
     let status = `📱 *Booking Status*: ${booking.confirmed ? '✅ Confirmed' : '🔄 In Progress'}`;
     if (booking.destination) status += `\n📍 ${truncate(booking.destination)}`;
-    if (booking.slotNumber !== undefined) status += `\n🅿️ Slot ${booking.slotNumber}`;
-    if (booking.price) status += `\n💰 Price: ₹${booking.price}`;
-    
+    if (booking.slotNumber !== undefined) {
+      const vehicleInfo = VEHICLE_TYPES.find(v => v.type === booking.vehicleType) || {};
+      status += `\n🅿️ Slot ${vehicleInfo.slotPrefix || ''}${booking.slotNumber}`;
+    }
     return status;
   },
   hasActiveBooking: async (userId) => {
     const booking = await getUserBooking(userId);
-    return booking?.confirmed;
+    return !!booking?.confirmed;
   },
-  VEHICLE_TYPES
+  VEHICLE_TYPES,
+  getSlotStatus: async (ownerId, slotIndex) => {
+    const [slot] = await db.select()
+      .from(slots)
+      .where(and(eq(slots.owner_id, ownerId), eq(slots.index, slotIndex)));
+    return slot;
+  },
+  cleanupExpiredBookings
 };
