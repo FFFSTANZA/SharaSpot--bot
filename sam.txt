@@ -1,0 +1,338 @@
+// bookingBot.js - FINAL | BULLETPROOF | Works with ANY slot.type
+
+const { getUserBooking, setUserBooking, setUserMode } = require('../sessions/sessionManager');
+const { sendWhatsAppMessage } = require('../services/whatsappService');
+const { normalizePhone } = require('../utils/normalizePhone');
+const { getOwnerByPhone } = require('../lib/ownerDb');
+const { db } = require('../database/db');
+const { owners, ownerVehicleTypes, slots, bookings } = require('../database/schema');
+const { eq, and, isNull } = require('drizzle-orm');
+const Fuse = require('fuse.js');
+const { v4: uuidv4 } = require('uuid');
+
+// --- Constants ---
+const TIMEOUT_LIMIT = 300000; // 5 minutes
+const BOOKING_STATES = {
+START: 1,
+GET_PHONE_VEHICLE: 2,
+GET_DESTINATION: 3,
+CONFIRM_BOOKING: 4,
+};
+
+const VEHICLE_TYPES = [
+{ type: 'Two-wheeler', aliases: ['bike', 'scooter', '2 wheeler', 'two', '2w'], icon: '🛵', slotPrefix: 'M' },
+{ type: '4-seat car', aliases: ['car', 'sedan', 'hatchback', '4 seater', '4s', '4 seat'], icon: '🚗', slotPrefix: 'C' },
+{ type: '8-seat car', aliases: ['suv', 'xl', '8 seater', '8s', 'big car'], icon: '🚙', slotPrefix: 'L' },
+{ type: 'Van', aliases: ['van', 'minivan', 'traveller'], icon: '🚐', slotPrefix: 'V' },
+];
+
+// --- Helper Functions ---
+function truncate(str, length = 20) {
+return str?.length > length ? str.slice(0, length) + '...' : str || '';
+}
+
+function isSessionExpired(booking) {
+return booking?.lastInteractionTime && Date.now() - booking.lastInteractionTime > TIMEOUT_LIMIT;
+}
+
+function cleanupSession(userId) {
+setUserBooking(userId, null);
+setUserMode(userId, 'AI');
+}
+
+function isValidPhone(phone) {
+return /^[6-9]\d{9}$/.test(phone);
+}
+
+function normalize(text) {
+return text?.toLowerCase().replace(/[-\s]/g, '') || '';
+}
+
+function matchVehicleType(input) {
+if (!input) return null;
+const norm = normalize(input);
+for (const vehicle of VEHICLE_TYPES) {
+if (vehicle.aliases.some(alias => {
+const aliasNorm = normalize(alias);
+return aliasNorm === norm || aliasNorm.includes(norm) || norm.includes(aliasNorm);
+})) {
+return vehicle.type;
+}
+}
+return null;
+}
+
+function generateBookingTicket(booking, owner) {
+const vehicleInfo = VEHICLE_TYPES.find(v => v.type === booking.vehicleType) || {};
+const slotDisplay = booking.slotNumber ? `${vehicleInfo.slotPrefix}${booking.slotNumber}` : 'TBD';
+return {
+id: booking.bookingId,
+slip: `
+🎫 *Parking Ticket Confirmed* 🅿️
+━━━━━━━━━━━━━━━━━━━━
+🆔 ${booking.bookingId}
+👤 ${booking.name}
+📞 ${booking.phone}
+${vehicleInfo.icon} ${booking.vehicleType}
+📍 ${booking.destination}
+🕒 ${new Date().toLocaleString()}
+🅿️ Slot ${slotDisplay}
+👷 ${owner.name || owner.phone_num}
+━━━━━━━━━━━━━━━━━━━━
+ℹ️ Present this ticket on arrival`.trim()
+};
+}
+
+// --- Core Logic ---
+async function findAvailableOwner(vehicleType, destinationText) {
+try {
+const dbOwners = await db.select().from(owners).where(eq(owners.is_active, true));
+if (dbOwners.length === 0) return { owner: null };
+
+const fuse = new Fuse(dbOwners, {
+keys: ['location', 'name'],
+threshold: 0.4,
+minMatchCharLength: 3,
+});
+
+const results = fuse.search(destinationText.trim());
+const owner = results[0]?.item || null;
+if (!owner) return { owner: null };
+
+// Check if owner supports the vehicle type
+const supportedTypes = await db.select({ type: ownerVehicleTypes.vehicle_type })
+.from(ownerVehicleTypes)
+.where(eq(ownerVehicleTypes.owner_id, owner.id));
+
+const hasSupport = supportedTypes.some(t =>
+normalize(t.type).includes(normalize(vehicleType)) ||
+normalize(vehicleType).includes(normalize(t.type))
+);
+
+if (supportedTypes.length > 0 && !hasSupport) {
+return { owner: null };
+}
+
+return { owner };
+} catch (err) {
+console.error('Error in findAvailableOwner:', err);
+return { owner: null };
+}
+}
+
+async function findAvailableSlot(ownerId, vehicleType) {
+try {
+// First: get all available slots for this owner
+const availableSlots = await db.select()
+.from(slots)
+.where(
+and(
+eq(slots.owner_id, ownerId),
+eq(slots.state, 'available')
+)
+);
+
+if (availableSlots.length === 0) return null;
+
+// We don't care about slot.type — just return the first available
+return availableSlots[0];
+} catch (err) {
+console.error('Error in findAvailableSlot:', err);
+return null;
+}
+}
+
+async function createBookingRecord(userId, ownerId, slot, bookingDetails) {
+const bookingId = `TKT-${uuidv4().slice(0, 8).toUpperCase()}`;
+await db.insert(bookings).values({
+id: bookingId,
+user_id: userId,
+owner_id: ownerId,
+slot_id: slot.id,
+slot_number: slot.index,
+vehicle_type: bookingDetails.vehicleType,
+destination: bookingDetails.destination,
+status: 'confirmed',
+created_at: new Date(),
+expires_at: new Date(Date.now() + 3600000), // 1 hour
+});
+return bookingId;
+}
+
+async function sendNotifications(userId, ownerPhone, ticketSlip) {
+try {
+await sendWhatsAppMessage(userId, ticketSlip);
+await sendWhatsAppMessage(ownerPhone, `📥 New Booking Received!\n${ticketSlip}`);
+} catch (err) {
+console.error('Notification failed:', err);
+}
+}
+
+// --- State Handlers ---
+async function handleStartState(userId, message, booking) {
+const name = message.trim();
+if (!name || name.length < 2) {
+return '👋 Please enter your full name (at least 2 characters).';
+}
+
+booking.name = name;
+booking.step = BOOKING_STATES.GET_PHONE_VEHICLE;
+setUserBooking(userId, booking);
+
+const vehicleOptions = VEHICLE_TYPES.map(v => `${v.icon} ${v.type}`).join('\n');
+return `👍 Got your name, *${name}*!\n\nPlease send:\n📱 Your phone number\n🚗 Your vehicle type\n\nAvailable vehicle types:\n${vehicleOptions}\n\nExample: \`9876543210, car\``;
+}
+
+async function handlePhoneVehicleState(userId, message, booking) {
+const parts = message.split(/[|,;]/).map(p => p.trim());
+const phoneRaw = parts[0];
+const vehicleRaw = parts.slice(1).join(' ');
+
+const phone = normalizePhone(phoneRaw);
+if (!isValidPhone(phone)) {
+return '⚠️ Please enter a valid 10-digit Indian phone number.\nExample: `9876543210, car`';
+}
+
+const vehicleType = matchVehicleType(vehicleRaw);
+if (!vehicleType) {
+const validTypes = VEHICLE_TYPES.map(v => `${v.icon} - ${v.type}`).join('\n');
+return `🚗 Please specify a valid vehicle type:\n${validTypes}\n\nExample: \`9876543210, car\``;
+}
+
+booking.phone = `+91${phone}`;
+booking.vehicleType = vehicleType;
+booking.step = BOOKING_STATES.GET_DESTINATION;
+setUserBooking(userId, booking);
+
+return '📍 Please send your destination (e.g., "Rajapalayam bus stand") or share your live location.';
+}
+
+async function handleDestinationState(userId, message, booking) {
+let destinationText;
+let lat, lon;
+
+if (typeof message === 'object' && message.lat && message.lon) {
+destinationText = "Your current location";
+lat = message.lat;
+lon = message.lon;
+} else {
+destinationText = message.trim();
+if (destinationText.length < 3) {
+return '📍 Please enter a valid destination (at least 3 characters).';
+}
+}
+
+const result = await findAvailableOwner(booking.vehicleType, destinationText);
+if (!result.owner) {
+return `❌ No parking found near "${truncate(destinationText)}".\nTry a different location or nearby landmark.`;
+}
+
+booking.matchedOwner = result.owner;
+booking.destination = result.owner.location || destinationText;
+booking.destinationLat = lat || result.owner.lat;
+booking.destinationLon = lon || result.owner.lon;
+booking.step = BOOKING_STATES.CONFIRM_BOOKING;
+setUserBooking(userId, booking);
+
+const vehicleInfo = VEHICLE_TYPES.find(v => v.type === booking.vehicleType) || {};
+return `📍 You selected: *${booking.destination}*\n🅿️ Managed by: ${result.owner.name}\n${vehicleInfo.icon} Vehicle: ${booking.vehicleType}\n\nType *Confirm* to book or *Cancel* to abort.`;
+}
+
+async function handleConfirmationState(userId, message, booking) {
+if (message.trim().toLowerCase() !== 'confirm') {
+return '❓ Please type *Confirm* to proceed or *Cancel* to exit.';
+}
+
+const owner = await getOwnerByPhone(booking.matchedOwner.phone_num);
+if (!owner || !owner.is_active) {
+cleanupSession(userId);
+return `❌ Sorry, parking at ${truncate(booking.destination)} is no longer available.`;
+}
+
+const slot = await findAvailableSlot(owner.id, booking.vehicleType);
+if (!slot) {
+cleanupSession(userId);
+return `🚗 No slots available at ${booking.destination}. Try again later.`;
+}
+
+try {
+await db.update(slots)
+.set({ state: 'occupied' })
+.where(eq(slots.id, slot.id));
+} catch (err) {
+console.error('Slot update failed:', err);
+cleanupSession(userId);
+return '❌ Failed to reserve slot. Please try again.';
+}
+
+booking.slotNumber = slot.index;
+booking.slotId = slot.id;
+booking.bookingId = await createBookingRecord(userId, owner.id, slot, booking);
+const ticket = generateBookingTicket(booking, owner);
+
+await sendNotifications(userId, owner.phone_num, ticket.slip);
+
+cleanupSession(userId);
+return `✅ Booking Confirmed!\n${ticket.slip}\nThank you for using our service!`;
+}
+
+// --- Main Handler ---
+async function handleBooking(userId, incomingMessage) {
+const message = (incomingMessage || '').trim();
+
+if (['exit', 'cancel', 'stop', 'abort'].some(cmd => message.toLowerCase().startsWith(cmd))) {
+cleanupSession(userId);
+return '🚫 Booking cancelled. Type *Book* to start again.';
+}
+
+let booking = await getUserBooking(userId);
+if (!booking) {
+booking = { step: BOOKING_STATES.START };
+}
+
+if (isSessionExpired(booking)) {
+cleanupSession(userId);
+return '⌛ Session expired. Type *Book* to restart.';
+}
+
+booking.lastInteractionTime = Date.now();
+setUserBooking(userId, booking);
+
+try {
+switch (booking.step) {
+case BOOKING_STATES.START:
+return await handleStartState(userId, message, booking);
+case BOOKING_STATES.GET_PHONE_VEHICLE:
+return await handlePhoneVehicleState(userId, message, booking);
+case BOOKING_STATES.GET_DESTINATION:
+return await handleDestinationState(userId, message, booking);
+case BOOKING_STATES.CONFIRM_BOOKING:
+return await handleConfirmationState(userId, message, booking);
+default:
+cleanupSession(userId);
+return '❌ Unknown state. Type *Book* to restart.';
+}
+} catch (err) {
+console.error('Booking error:', err);
+cleanupSession(userId);
+return '❌ Something went wrong. Please try again.';
+}
+}
+
+// --- Exported Utilities ---
+module.exports = {
+handleBooking,
+
+getUserBookingStatus: async (userId) => {
+const booking = await getUserBooking(userId);
+if (!booking) return '📭 No active booking.';
+return `📱 *Booking Status*: ${booking.confirmed ? '✅ Confirmed' : '🔄 In Progress'}\n📍 ${truncate(booking.destination)}`;
+},
+
+hasActiveBooking: async (userId) => {
+const booking = await getUserBooking(userId);
+return !!booking?.confirmed;
+},
+
+VEHICLE_TYPES,
+};

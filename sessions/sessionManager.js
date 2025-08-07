@@ -6,7 +6,7 @@ const {
   ownerVehicleTypes
 } = require('../database/schema');
 const { get_user_by_id } = require('../lib/userDb');
-const { getOwnerByPhone } = require('../lib/ownerDb');
+const { getOwnerByPhone, createOwnerIfNotExists } = require('../lib/ownerDb');
 const { normalizePhone } = require('../utils/normalizePhone');
 
 const sessions = {};
@@ -16,6 +16,7 @@ async function getSessionId(userId) {
   const user = await get_user_by_id(userId);
   return user?.number ? normalizePhone(user.number) : userId; // Fallback to userId if no number
 }
+
 async function getUserMode(userId) {
   const id = await getSessionId(userId);
   return sessions[id]?.mode || 'AI';
@@ -43,7 +44,7 @@ async function setUserBooking(userId, booking) {
   sessions[id].booking = booking;
 }
 
-// Preserved existing session keys (pendingAction, mode, etc.)
+// Get owner data with proper error handling
 async function getOwnerData(userId, forceRefresh = false) {
   const id = await getSessionId(userId);
   if (!id) return null;
@@ -110,7 +111,7 @@ async function addOwner(phone, name = 'New Owner') {
       is_active: false,
       total_slots: 0,
       location: 'Unknown',
-      lastUpdated: new Date(),
+      last_updated: new Date(),
       created_at: new Date(),
       updated_at: new Date()
     }).returning();
@@ -129,17 +130,22 @@ async function addOwner(phone, name = 'New Owner') {
   }
 }
 
-async function setOwnerStatus(userId, status) {
+async function setOwnerStatus(userId, isActive) {
   const id = await getSessionId(userId);
   if (!id) return false;
+  
   try {
+    const [owner] = await db.select().from(owners).where(eq(owners.phone_num, id)).limit(1);
+    if (!owner) return false;
+
     await db.update(owners).set({
-      is_active: status === 'active',
-      lastUpdated: new Date()
-    }).where(eq(owners.phone_num, id));
+      is_active: isActive,
+      last_updated: new Date()
+    }).where(eq(owners.id, owner.id));
 
     if (sessions[id]?.ownerData) {
-      sessions[id].ownerData.status = status;
+      sessions[id].ownerData.is_active = isActive;
+      sessions[id].ownerData.status = isActive ? 'active' : 'inactive';
     }
     return true;
   } catch (err) {
@@ -147,11 +153,15 @@ async function setOwnerStatus(userId, status) {
     return false;
   }
 }
+
 async function saveOwnerLocation(userId, { lat, lon, text }) {
   const id = await getSessionId(userId);
   if (!id) return false;
 
   try {
+    const [owner] = await db.select().from(owners).where(eq(owners.phone_num, id)).limit(1);
+    if (!owner) return false;
+
     await db.update(owners)
       .set({
         lat,
@@ -159,7 +169,7 @@ async function saveOwnerLocation(userId, { lat, lon, text }) {
         location: text,
         last_updated: new Date()
       })
-      .where(eq(owners.phone_num, id));
+      .where(eq(owners.id, owner.id));
 
     // Update session cache
     if (sessions[id]?.ownerData) {
@@ -175,65 +185,80 @@ async function saveOwnerLocation(userId, { lat, lon, text }) {
   }
 }
 
-
 async function updateOwnerLocation(userId, textLocation) {
   const id = await getSessionId(userId);
   if (!id) return false;
 
-  const [owner] = await db.select().from(owners).where(eq(owners.phone_num, id)).limit(1);
-  if (!owner) return false;
+  try {
+    const [owner] = await db.select().from(owners).where(eq(owners.phone_num, id)).limit(1);
+    if (!owner) return false;
 
-  await db.update(owners)
-    .set({ location: textLocation, last_updated: new Date() })
-    .where(eq(owners.id, owner.id));
+    await db.update(owners)
+      .set({ location: textLocation, last_updated: new Date() })
+      .where(eq(owners.id, owner.id));
 
-  // Update session cache
-  if (sessions[id]?.ownerData) {
-    sessions[id].ownerData.location = textLocation;
+    // Update session cache
+    if (sessions[id]?.ownerData) {
+      sessions[id].ownerData.location = textLocation;
+    }
+
+    return true;
+  } catch (err) {
+    console.error('updateOwnerLocation error:', err);
+    return false;
   }
-
-  return true;
 }
 
-// Always update session after changing slots
-async function addSlotsToOwner(ownerId, slotArray) {
+// Fixed addSlotsToOwner function
+async function addSlotsToOwner(userId, slotArray) {
+  const id = await getSessionId(userId);
+  if (!id) return false;
+
   try {
-    if (!ownerId || !Array.isArray(slotArray)) throw new Error('Invalid slot input');
+    const [owner] = await db.select().from(owners).where(eq(owners.phone_num, id)).limit(1);
+    if (!owner) return false;
 
-    const existingSlots = await db
-      .select()
-      .from(slots)
-      .where(eq(slots.owner_id, ownerId));
+    const ownerId = owner.id;
 
-    const existingIndices = new Set(existingSlots.map(s => s.index));
+    // Delete existing slots first for complete replacement
+    await db.delete(slots).where(eq(slots.owner_id, ownerId));
 
-    const newSlotData = slotArray.map((slot, i) => {
-      const index = slot.index ?? i;
-      if (existingIndices.has(index)) {
-        throw new Error(`Slot index ${index} already exists for this owner`);
-      }
-
-      // ✅ FORCE the correct ID format: ${ownerId}-${index}
-      return {
-        id: `${ownerId}-${index}`,           // ← Add this line
+    if (Array.isArray(slotArray) && slotArray.length > 0) {
+      const newSlotData = slotArray.map((slot) => ({
+        id: `${ownerId}-${slot.index}`,
         owner_id: ownerId,
-        index,
+        index: slot.index,
         type: slot.type ?? 'Two-wheeler',
         state: slot.state ?? 'available',
-        is_occupied: slot.isOccupied ?? false,
+        is_occupied: slot.state === 'occupied',
         connected_to: slot.connectedTo ?? null,
-        notes: slot.notes ?? ''
-      };
-    });
+        notes: slot.notes ?? '',
+        created_at: new Date(),
+        last_status_change: new Date()
+      }));
 
-    await db.insert(slots).values(newSlotData);
+      await db.insert(slots).values(newSlotData);
+    }
+
+    // Update total_slots in owners table
+    await db.update(owners)
+      .set({ 
+        total_slots: slotArray.length, 
+        last_updated: new Date() 
+      })
+      .where(eq(owners.id, ownerId));
+
+    // Clear session cache to force refresh
+    if (sessions[id]?.ownerData) {
+      delete sessions[id].ownerData;
+    }
+
     return true;
   } catch (error) {
-    console.error(`❌ Failed to add slots to owner "${ownerId}":`, error);
-    throw error;
+    console.error(`Failed to add slots to owner "${userId}":`, error);
+    return false;
   }
 }
-
 
 async function updateSlotState(userId, slotIndex, state) {
   const id = await getSessionId(userId);
@@ -243,16 +268,24 @@ async function updateSlotState(userId, slotIndex, state) {
     const [owner] = await db.select().from(owners).where(eq(owners.phone_num, id)).limit(1);
     if (!owner) return false;
 
-    await db.update(slots)
-      .set({ state, last_status_change: new Date() })
-      .where(and(eq(slots.owner_id, owner.id), eq(slots.index, slotIndex)));
+    const [updated] = await db.update(slots)
+      .set({ 
+        state, 
+        is_occupied: state === 'occupied',
+        last_status_change: new Date() 
+      })
+      .where(and(eq(slots.owner_id, owner.id), eq(slots.index, slotIndex)))
+      .returning();
 
-    if (sessions[id]?.ownerData?.slots) {
+    if (updated && sessions[id]?.ownerData?.slots) {
       const slot = sessions[id].ownerData.slots.find(s => s.index === slotIndex);
-      if (slot) slot.state = state;
+      if (slot) {
+        slot.state = state;
+        slot.is_occupied = state === 'occupied';
+      }
     }
 
-    return true;
+    return !!updated;
   } catch (err) {
     console.error('updateSlotState error:', err);
     return false;
@@ -315,7 +348,7 @@ async function check_and_switch_to_owner_mode(userId) {
 
 async function markSlotBooked(ownerId, slotIndex) {
   try {
-    const result = await db
+    const [updated] = await db
       .update(slots)
       .set({
         state: 'occupied',
@@ -325,7 +358,8 @@ async function markSlotBooked(ownerId, slotIndex) {
       .where(and(
         eq(slots.owner_id, ownerId),
         eq(slots.index, slotIndex)
-      ));
+      ))
+      .returning();
 
     // Update session cache if exists
     const sessionId = normalizePhone(ownerId);
@@ -337,14 +371,14 @@ async function markSlotBooked(ownerId, slotIndex) {
       }
     }
 
-    return result.rowCount > 0;
+    return !!updated;
   } catch (err) {
     console.error('markSlotBooked error:', err);
     return false;
   }
 }
+
 module.exports = {
-  normalizePhone,
   getUserMode,
   setUserMode,
   getUserBooking,
@@ -358,5 +392,7 @@ module.exports = {
   setPendingAction,
   getPendingAction,
   check_and_switch_to_owner_mode,
-  markSlotBooked
+  markSlotBooked,
+  saveOwnerLocation,
+  createOwnerIfNotExists 
 };
